@@ -27,7 +27,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from . import __version__
+from . import __version__, audit_stream
 from .drift import compute_drift
 from .fetcher import DEFAULT_TIMEOUT_S, FetchError, canonical_hash, fetch_and_parse, now_iso
 from .models import DriftReport, SpecKind, ValidationResult, Watch
@@ -190,7 +190,23 @@ async def create_watch(req: _CreateWatchRequest) -> Watch:
         include_body=True,
     )
     watch = _watches().create(req.url, spec_hint=req.spec_hint)
-    return _watches().record(watch.watch_id, result)
+    recorded = _watches().record(watch.watch_id, result)
+
+    # Best-effort audit-stream emission.
+    await audit_stream.emit(
+        _client(),
+        kind="watch_created",
+        payload={
+            "watch_id": watch.watch_id,
+            "url": req.url,
+            "spec": spec,
+            "spec_version": version,
+            "content_hash": content_hash,
+            "valid": result.valid,
+        },
+    )
+
+    return recorded
 
 
 @app.get("/watches", tags=["watches"])
@@ -239,7 +255,44 @@ async def recheck_watch(watch_id: str) -> DriftReport:
     )
     previous = _watches().previous(watch_id)
     _watches().record(watch_id, new_result)
-    return compute_drift(previous, new_result)
+    drift = compute_drift(previous, new_result)
+
+    # Best-effort audit-stream emission. We fire at most ONE event per
+    # recheck — validity_flipped takes precedence over drifted since it's
+    # the more actionable signal.
+    if drift.became_invalid or drift.became_valid:
+        await audit_stream.emit(
+            _client(),
+            kind="watch_validity_flipped",
+            payload={
+                "watch_id": watch_id,
+                "url": watch.url,
+                "became_invalid": drift.became_invalid,
+                "became_valid": drift.became_valid,
+                "spec": spec,
+                "content_hash_before": drift.content_hash_before,
+                "content_hash_after": drift.content_hash_after,
+                "after_issues": drift.after_issues,
+            },
+        )
+    elif drift.drifted:
+        await audit_stream.emit(
+            _client(),
+            kind="watch_drifted",
+            payload={
+                "watch_id": watch_id,
+                "url": watch.url,
+                "spec": spec,
+                "spec_changed": drift.spec_changed,
+                "content_hash_before": drift.content_hash_before,
+                "content_hash_after": drift.content_hash_after,
+                "added_fields": drift.added_fields,
+                "removed_fields": drift.removed_fields,
+                "changed_fields": drift.changed_fields,
+            },
+        )
+
+    return drift
 
 
 @app.delete("/watches/{watch_id}", tags=["watches"], status_code=204)
