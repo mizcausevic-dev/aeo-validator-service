@@ -48,7 +48,7 @@ class ValidationResult(StrictModel):
     issues: list[ValidationIssue] = Field(default_factory=list)
     body: dict[str, Any] | None = Field(
         default=None,
-        description="The fetched body. Omitted from /watches outputs to keep them small.",
+        description="The fetched body when requested for one-shot validation; omitted from watch API responses.",
     )
 
 
@@ -75,8 +75,8 @@ class DriftReport(StrictModel):
 
 class Watch(StrictModel):
     """
-    A persistent watch on a URL. Holds the history of validation results so
-    drift comparisons have somewhere to anchor.
+    A process-local watch on a URL. It holds bounded validation history for
+    drift comparisons and disappears when the process restarts.
     """
 
     watch_id: str

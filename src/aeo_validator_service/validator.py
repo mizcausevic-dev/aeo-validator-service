@@ -51,6 +51,15 @@ class SuiteValidator:
     def validate(self, body: dict[str, Any]) -> tuple[SpecKind, str | None, list[ValidationIssue]]:
         spec, version = self.detect_spec(body)
         issues: list[ValidationIssue] = []
+        present_versions = [field for field in _SPEC_BY_VERSION_FIELD if field in body]
+        if len(present_versions) > 1:
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    kind="ambiguous_spec",
+                    message="document contains more than one recognised spec version field",
+                )
+            )
         issues.extend(self._validate_universal(body, spec))
         if spec == "aeo":
             issues.extend(self._validate_aeo(body))
@@ -71,11 +80,11 @@ class SuiteValidator:
         if spec == "unknown":
             out.append(
                 ValidationIssue(
-                    severity="warning",
+                    severity="error",
                     field=None,
                     kind="unknown_spec",
                     message=(
-                        "No `*_version` field recognised; treating as a generic JSON document. "
+                        "No `*_version` field recognised; this is not a supported Suite document. "
                         "If this is a Kinetic Gain Suite doc, make sure the version field exists."
                     ),
                 )

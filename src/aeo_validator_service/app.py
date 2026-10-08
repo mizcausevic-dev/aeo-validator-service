@@ -30,7 +30,7 @@ from pydantic import BaseModel
 from . import __version__, audit_stream
 from .drift import compute_drift
 from .fetcher import DEFAULT_TIMEOUT_S, FetchError, canonical_hash, fetch_and_parse, now_iso
-from .models import DriftReport, SpecKind, ValidationResult, Watch
+from .models import DriftReport, SpecKind, ValidationIssue, ValidationResult, Watch
 from .validator import SuiteValidator
 from .watch_store import WatchStore
 
@@ -54,7 +54,8 @@ class _CreateWatchRequest(BaseModel):
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(DEFAULT_TIMEOUT_S),
-        follow_redirects=True,
+        follow_redirects=False,
+        trust_env=False,
         headers={"User-Agent": f"aeo-validator-service/{__version__} (+https://kineticgain.com)"},
     )
     app.state.validator = SuiteValidator()
@@ -69,8 +70,8 @@ app = FastAPI(
     title="aeo-validator-service",
     version=__version__,
     description=(
-        "Always-on validator for AEO + Kinetic Gain Protocol Suite documents. "
-        "Layer 4 of the AEO Reference Stack."
+        "Local HTTP smoke validator for eleven recognised Kinetic Gain Suite document kinds. "
+        "URL fetching is opt-in; drift watches are process-local and caller-triggered."
     ),
     lifespan=_lifespan,
 )
@@ -90,15 +91,36 @@ def _watches() -> WatchStore:
     return cast(WatchStore, app.state.watches)
 
 
+def _public_result(result: ValidationResult) -> ValidationResult:
+    return result.model_copy(update={"body": None})
+
+
+def _public_watch(watch: Watch) -> Watch:
+    last = _public_result(watch.last_result) if watch.last_result else None
+    return watch.model_copy(update={"last_result": last})
+
+
+def _check_spec_hint(spec: SpecKind, hint: SpecKind | None, issues: list[ValidationIssue]) -> None:
+    if hint is not None and hint != spec:
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                kind="spec_hint_mismatch",
+                message="detected spec does not match the watch's spec_hint",
+            )
+        )
+
+
 @app.get("/", tags=["meta"])
 async def root() -> dict[str, Any]:
     return {
         "name": "aeo-validator-service",
         "version": __version__,
         "description": (
-            "Fetches Kinetic Gain Protocol Suite documents by URL, validates them, "
-            "hashes them canonically, tracks drift across re-checks."
+            "Optionally fetches allowlisted Suite documents, runs limited structural checks, "
+            "computes a legacy JSON hash, and compares caller-triggered re-checks."
         ),
+        "validation_scope": "smoke checks only; no full schema, signature, or authority verification",
         "specs_supported": [
             "aeo",
             "agent-card",
@@ -155,7 +177,10 @@ async def validate_by_url(req: _ValidateByUrlRequest) -> ValidationResult:
 @app.post("/validate/inline", tags=["validate"])
 async def validate_inline(req: _ValidateInlineRequest) -> ValidationResult:
     body = req.body
-    content_hash = canonical_hash(body)
+    try:
+        content_hash = canonical_hash(body)
+    except (TypeError, ValueError) as err:
+        raise HTTPException(status_code=400, detail="inline document is not valid JSON data") from err
     spec, version, issues = _validator().validate(body)
     return SuiteValidator.result(
         url="inline://anonymous",
@@ -177,8 +202,9 @@ async def create_watch(req: _CreateWatchRequest) -> Watch:
         raise HTTPException(status_code=400, detail=str(err)) from err
 
     spec, version, issues = _validator().validate(body)
-    # Always store with the body so drift comparisons on subsequent rechecks
-    # have a real baseline. API consumers can ignore the field.
+    _check_spec_hint(spec, req.spec_hint, issues)
+    # Retain the latest body internally for drift comparison. Public watch
+    # responses omit it.
     result = SuiteValidator.result(
         url=req.url,
         body=body,
@@ -189,7 +215,10 @@ async def create_watch(req: _CreateWatchRequest) -> Watch:
         issues=issues,
         include_body=True,
     )
-    watch = _watches().create(req.url, spec_hint=req.spec_hint)
+    try:
+        watch = _watches().create(req.url, spec_hint=req.spec_hint)
+    except OverflowError as err:
+        raise HTTPException(status_code=429, detail=str(err)) from err
     recorded = _watches().record(watch.watch_id, result)
 
     # Best-effort audit-stream emission.
@@ -206,7 +235,7 @@ async def create_watch(req: _CreateWatchRequest) -> Watch:
         },
     )
 
-    return recorded
+    return _public_watch(recorded)
 
 
 @app.get("/watches", tags=["watches"])
@@ -217,7 +246,7 @@ async def list_watches() -> dict[str, list[str]]:
 @app.get("/watches/{watch_id}", tags=["watches"])
 async def get_watch(watch_id: str) -> Watch:
     try:
-        return _watches().get(watch_id)
+        return _public_watch(_watches().get(watch_id))
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
 
@@ -225,7 +254,7 @@ async def get_watch(watch_id: str) -> Watch:
 @app.get("/watches/{watch_id}/history", tags=["watches"])
 async def get_watch_history(watch_id: str) -> list[ValidationResult]:
     try:
-        return _watches().history(watch_id)
+        return [_public_result(result) for result in _watches().history(watch_id)]
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
 
@@ -243,6 +272,7 @@ async def recheck_watch(watch_id: str) -> DriftReport:
         raise HTTPException(status_code=400, detail=str(err)) from err
 
     spec, version, issues = _validator().validate(body)
+    _check_spec_hint(spec, watch.spec_hint, issues)
     new_result = SuiteValidator.result(
         url=watch.url,
         body=body,
@@ -254,7 +284,10 @@ async def recheck_watch(watch_id: str) -> DriftReport:
         include_body=True,
     )
     previous = _watches().previous(watch_id)
-    _watches().record(watch_id, new_result)
+    try:
+        _watches().record(watch_id, new_result)
+    except KeyError as err:
+        raise HTTPException(status_code=404, detail="unknown watch_id") from err
     drift = compute_drift(previous, new_result)
 
     # Best-effort audit-stream emission. We fire at most ONE event per

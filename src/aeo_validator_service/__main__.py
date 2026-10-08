@@ -9,7 +9,7 @@ def main() -> None:
     import uvicorn
 
     port = int(os.environ.get("PORT", "8091"))
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "127.0.0.1")
     uvicorn.run("aeo_validator_service.app:app", host=host, port=port, log_level="info")
 
 

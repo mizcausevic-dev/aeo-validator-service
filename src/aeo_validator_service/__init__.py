@@ -1,5 +1,5 @@
 """
-aeo-validator-service — always-on AEO + Kinetic Gain Protocol Suite validator.
+aeo-validator-service — local HTTP smoke validator for Suite documents.
 
 The fourth layer of the AEO Reference Stack:
 
@@ -12,13 +12,13 @@ The fourth layer of the AEO Reference Stack:
 What the CLI doesn't give you that this service does:
 
     - HTTP API for non-Python callers
-    - Persistent per-URL history of content_hash + validation_result
+    - Bounded, process-local per-URL history of content_hash + validation_result
     - Drift detection: "did this vendor's AEO change since the last check?"
     - Diff output that points at the field-level change
-    - Scheduled re-validation (POST /watches, then GET /watches/{id})
+    - Caller-triggered re-validation (POST /watches/{id}/recheck)
 
-The service knows how to validate every spec in the Suite by sniffing the
-top-level `*_version` field, the same trick the unified visualizer uses.
+The service sniffs eleven recognised top-level `*_version` fields and applies
+shallow checks. It is not a full schema or authority validator.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from .models import (
 )
 from .validator import SuiteValidator
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "DriftReport",

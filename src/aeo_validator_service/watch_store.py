@@ -17,6 +17,9 @@ from threading import Lock
 from .fetcher import now_iso
 from .models import ValidationResult, Watch
 
+MAX_WATCHES = 16
+MAX_HISTORY = 20
+
 
 class WatchStore:
     """Thread-safe in-memory watch + result history."""
@@ -31,6 +34,8 @@ class WatchStore:
     def create(self, url: str, *, spec_hint: str | None = None) -> Watch:
         watch_id = uuid.uuid4().hex[:12]
         with self._lock:
+            if len(self._watches) >= MAX_WATCHES:
+                raise OverflowError("watch limit reached")
             watch = Watch(
                 watch_id=watch_id,
                 url=url,
@@ -50,10 +55,13 @@ class WatchStore:
                 watch = self._watches[watch_id]
             except KeyError as err:
                 raise KeyError(f"unknown watch_id: {watch_id!r}") from err
-            self._history[watch_id].append(result)
-            updated = watch.model_copy(
-                update={"last_result": result, "history_count": len(self._history[watch_id])}
-            )
+            history = self._history[watch_id]
+            if history:
+                history[-1] = history[-1].model_copy(update={"body": None})
+            history.append(result)
+            if len(history) > MAX_HISTORY:
+                history.pop(0)
+            updated = watch.model_copy(update={"last_result": result, "history_count": len(history)})
             self._watches[watch_id] = updated
         return updated
 
