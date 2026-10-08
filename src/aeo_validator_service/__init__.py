@@ -12,7 +12,7 @@ The fourth layer of the AEO Reference Stack:
 What the CLI doesn't give you that this service does:
 
     - HTTP API for non-Python callers
-    - Bounded, process-local per-URL history of content_hash + validation_result
+    - Bounded per-URL history of content_hash + validation_result
     - Drift detection: "did this vendor's AEO change since the last check?"
     - Diff output that points at the field-level change
     - Caller-triggered re-validation (POST /watches/{id}/recheck)
@@ -32,7 +32,7 @@ from .models import (
 )
 from .validator import SuiteValidator
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "DriftReport",

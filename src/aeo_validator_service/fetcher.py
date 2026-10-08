@@ -44,7 +44,7 @@ def _allowed_hosts() -> set[str]:
     }
 
 
-async def _check_public_dns(host: str) -> None:
+async def _check_public_dns(host: str) -> str:
     try:
         answers = await wait_for(
             get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM),
@@ -56,13 +56,16 @@ async def _check_public_dns(host: str) -> None:
         raise FetchError("URL host could not be resolved") from err
     if not answers:
         raise FetchError("URL host could not be resolved")
+    addresses: list[str] = []
     for answer in answers:
         address = ipaddress.ip_address(answer[4][0])
         if not address.is_global:
             raise FetchError("URL host resolves to a non-public address")
+        addresses.append(str(address))
+    return addresses[0]
 
 
-async def _check_url(url: str) -> None:
+async def _check_url(url: str) -> tuple[httpx.URL, str, str]:
     if len(url) > MAX_URL_LENGTH:
         raise FetchError("URL is too long")
     try:
@@ -86,7 +89,8 @@ async def _check_url(url: str) -> None:
         pass
     else:
         raise FetchError("IP-literal URLs are not allowed")
-    await _check_public_dns(host)
+    address = await _check_public_dns(host)
+    return parsed, host, address
 
 
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -133,11 +137,23 @@ async def fetch_and_parse(
     """
     Fetch `url`, enforce the size cap, parse as JSON, and return
     `(body, content_hash)`. Caller passes a shared `AsyncClient` so the
-    service can reuse the connection pool across requests.
+    service can reuse its client configuration. The actual request targets the
+    checked IP, with the original hostname as the HTTP Host and TLS SNI.
+    This binds the connection to the checked DNS answer.
     """
-    await _check_url(url)
+    parsed_url, host, address = await _check_url(url)
+    # A request to the hostname would resolve it a second time inside httpx,
+    # leaving a DNS rebinding window. Connect to the checked address instead.
+    # sni_hostname is forwarded by httpx/httpcore to TLS certificate checking.
+    pinned_url = parsed_url.copy_with(host=address)
     try:
-        async with client.stream("GET", url, follow_redirects=False) as response:
+        async with client.stream(
+            "GET",
+            pinned_url,
+            headers={"Host": host, "Connection": "close"},
+            extensions={"sni_hostname": host},
+            follow_redirects=False,
+        ) as response:
             if response.is_redirect:
                 raise FetchError("redirects are not allowed")
             response.raise_for_status()

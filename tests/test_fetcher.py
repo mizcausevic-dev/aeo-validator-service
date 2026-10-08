@@ -61,8 +61,8 @@ async def test_dns_resolution_has_a_timeout(monkeypatch: pytest.MonkeyPatch) -> 
 async def test_redirect_is_not_followed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AEO_FETCH_ALLOWED_HOSTS", "vendor.example")
 
-    async def public_dns(_host: str) -> None:
-        return None
+    async def public_dns(_host: str) -> str:
+        return "93.184.215.14"
 
     monkeypatch.setattr(fetcher, "_check_public_dns", public_dns)
     visited: list[str] = []
@@ -74,15 +74,15 @@ async def test_redirect_is_not_followed(monkeypatch: pytest.MonkeyPatch) -> None
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(fetcher.FetchError, match="redirects are not allowed"):
             await fetcher.fetch_and_parse(client, "https://vendor.example/doc.json")
-    assert visited == ["https://vendor.example/doc.json"]
+    assert visited == ["https://93.184.215.14/doc.json"]
 
 
 @pytest.mark.asyncio
 async def test_streaming_response_stops_at_size_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AEO_FETCH_ALLOWED_HOSTS", "vendor.example")
 
-    async def public_dns(_host: str) -> None:
-        return None
+    async def public_dns(_host: str) -> str:
+        return "93.184.215.14"
 
     monkeypatch.setattr(fetcher, "_check_public_dns", public_dns)
     async with httpx.AsyncClient(
