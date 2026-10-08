@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from aeo_validator_service import app as app_module
+from aeo_validator_service import fetcher
 from aeo_validator_service.app import app
 
 SAMPLE_AEO: dict[str, Any] = {
@@ -56,9 +57,15 @@ def client_with_aeo(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, dict[s
     """TestClient + a handle to swap the mocked AEO payload mid-test."""
     transport, state = _make_router(SAMPLE_AEO)
     real_async_client = httpx.AsyncClient
+    monkeypatch.setenv("AEO_FETCH_ALLOWED_HOSTS", "acme.example")
+
+    async def public_dns(_host: str) -> None:
+        return None
+
+    monkeypatch.setattr(fetcher, "_check_public_dns", public_dns)
 
     def factory(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
-        return real_async_client(transport=transport, follow_redirects=True)
+        return real_async_client(transport=transport, follow_redirects=False)
 
     monkeypatch.setattr(app_module.httpx, "AsyncClient", factory)
     with TestClient(app) as c:
@@ -133,6 +140,13 @@ class TestValidateInline:
         )
         assert r.json()["valid"] is False
 
+    def test_inline_nonfinite_number_is_rejected(
+        self, client_with_aeo: tuple[TestClient, dict[str, dict[str, Any]]]
+    ) -> None:
+        client, _ = client_with_aeo
+        r = client.post("/validate/inline", content=b'{"body":{"aeo_version":"0.1","n":NaN}}')
+        assert r.status_code == 422
+
 
 class TestWatchLifecycle:
     def test_create_and_recheck_no_drift(
@@ -176,6 +190,44 @@ class TestWatchLifecycle:
 
         h = client.get(f"/watches/{watch_id}/history").json()
         assert len(h) == 2
+        assert all(item["body"] is None for item in h)
+
+    def test_watch_responses_do_not_expose_fetched_body(
+        self, client_with_aeo: tuple[TestClient, dict[str, dict[str, Any]]]
+    ) -> None:
+        client, _ = client_with_aeo
+        created = client.post("/watches", json={"url": "https://acme.example/.well-known/aeo.json"})
+        assert created.json()["last_result"]["body"] is None
+        watch_id = created.json()["watch_id"]
+        assert client.get(f"/watches/{watch_id}").json()["last_result"]["body"] is None
+
+    def test_spec_hint_mismatch_is_invalid(
+        self, client_with_aeo: tuple[TestClient, dict[str, dict[str, Any]]]
+    ) -> None:
+        client, _ = client_with_aeo
+        created = client.post(
+            "/watches", json={"url": "https://acme.example/.well-known/aeo.json", "spec_hint": "tool-card"}
+        )
+        assert created.status_code == 201
+        assert created.json()["last_result"]["valid"] is False
+        assert created.json()["last_result"]["issues"][0]["kind"] == "spec_hint_mismatch"
+
+    def test_full_watch_store_rejects_before_fetch(
+        self,
+        client_with_aeo: tuple[TestClient, dict[str, dict[str, Any]]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from aeo_validator_service import watch_store
+
+        client, _ = client_with_aeo
+        monkeypatch.setattr(watch_store, "MAX_WATCHES", 0)
+
+        async def unexpected_fetch(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("fetch should not run when watch capacity is exhausted")
+
+        monkeypatch.setattr(app_module, "fetch_and_parse", unexpected_fetch)
+        response = client.post("/watches", json={"url": "https://acme.example/.well-known/aeo.json"})
+        assert response.status_code == 429
 
     def test_list_and_get(self, client_with_aeo: tuple[TestClient, dict[str, dict[str, Any]]]) -> None:
         client, _ = client_with_aeo

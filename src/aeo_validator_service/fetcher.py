@@ -9,7 +9,12 @@ content_hash values for identical documents.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import math
+import os
+import socket
+from asyncio import get_running_loop, wait_for
 from datetime import UTC, datetime
 from typing import Any
 
@@ -17,6 +22,7 @@ import httpx
 
 DEFAULT_TIMEOUT_S = 10.0
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
+MAX_URL_LENGTH = 2048
 
 
 class FetchError(Exception):
@@ -24,9 +30,98 @@ class FetchError(Exception):
 
 
 def canonical_hash(parsed: object) -> str:
-    """sha256 of canonical JSON (sorted keys, no whitespace)."""
-    canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    """Legacy Suite sha256 profile: Python sorted-key JSON, not RFC 8785 JCS."""
+    canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _allowed_hosts() -> set[str]:
+    """Network fetches are opt-in and limited to exact hostnames."""
+    return {
+        host.strip().lower().rstrip(".")
+        for host in os.getenv("AEO_FETCH_ALLOWED_HOSTS", "").split(",")
+        if host.strip()
+    }
+
+
+async def _check_public_dns(host: str) -> None:
+    try:
+        answers = await wait_for(
+            get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM),
+            timeout=DEFAULT_TIMEOUT_S,
+        )
+    except TimeoutError as err:
+        raise FetchError("URL host resolution timed out") from err
+    except OSError as err:
+        raise FetchError("URL host could not be resolved") from err
+    if not answers:
+        raise FetchError("URL host could not be resolved")
+    for answer in answers:
+        address = ipaddress.ip_address(answer[4][0])
+        if not address.is_global:
+            raise FetchError("URL host resolves to a non-public address")
+
+
+async def _check_url(url: str) -> None:
+    if len(url) > MAX_URL_LENGTH:
+        raise FetchError("URL is too long")
+    try:
+        parsed = httpx.URL(url)
+    except (ValueError, httpx.InvalidURL) as err:
+        raise FetchError("invalid URL") from err
+    host = (parsed.host or "").lower().rstrip(".")
+    if (
+        parsed.scheme != "https"
+        or parsed.port not in (None, 443)
+        or parsed.userinfo
+        or parsed.fragment
+        or parsed.query
+    ):
+        raise FetchError("URL must be HTTPS on port 443 without credentials, query, or fragment")
+    if not host or host not in _allowed_hosts():
+        raise FetchError("URL host is not allowed for fetching")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise FetchError("IP-literal URLs are not allowed")
+    await _check_public_dns(host)
+
+
+def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _reject_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _finite_float(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError("non-finite JSON number")
+    return value
+
+
+def parse_document(body_bytes: bytes) -> dict[str, Any]:
+    try:
+        parsed = json.loads(
+            body_bytes.decode("utf-8"),
+            object_pairs_hook=_unique_pairs,
+            parse_constant=_reject_constant,
+            parse_float=_finite_float,
+        )
+    except (UnicodeDecodeError, ValueError) as err:
+        raise FetchError("invalid JSON document") from err
+    if not isinstance(parsed, dict):
+        raise FetchError("top-level JSON must be an object")
+    return parsed
 
 
 async def fetch_and_parse(
@@ -40,35 +135,33 @@ async def fetch_and_parse(
     `(body, content_hash)`. Caller passes a shared `AsyncClient` so the
     service can reuse the connection pool across requests.
     """
+    await _check_url(url)
     try:
-        response = await client.get(url)
-        response.raise_for_status()
+        async with client.stream("GET", url, follow_redirects=False) as response:
+            if response.is_redirect:
+                raise FetchError("redirects are not allowed")
+            response.raise_for_status()
+            length = response.headers.get("content-length")
+            if length is not None:
+                try:
+                    if int(length) > max_bytes:
+                        raise FetchError("response exceeds size limit")
+                except ValueError:
+                    pass
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise FetchError("response exceeds size limit")
+                chunks.append(chunk)
     except httpx.TimeoutException as err:
-        raise FetchError(f"{url}: timeout") from err
+        raise FetchError("fetch timed out") from err
     except httpx.HTTPStatusError as err:
-        raise FetchError(f"{url}: HTTP {err.response.status_code}") from err
+        raise FetchError(f"upstream HTTP {err.response.status_code}") from err
     except httpx.RequestError as err:
-        raise FetchError(f"{url}: {type(err).__name__}: {err}") from err
-
-    if response.headers.get("content-length"):
-        try:
-            if int(response.headers["content-length"]) > max_bytes:
-                raise FetchError(f"{url}: content-length exceeds {max_bytes} bytes")
-        except ValueError:
-            pass
-
-    body_bytes = response.content
-    if len(body_bytes) > max_bytes:
-        raise FetchError(f"{url}: response body exceeds {max_bytes} bytes")
-
-    try:
-        parsed = json.loads(body_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as err:
-        raise FetchError(f"{url}: invalid JSON ({err})") from err
-
-    if not isinstance(parsed, dict):
-        raise FetchError(f"{url}: top-level JSON must be an object")
-
+        raise FetchError("fetch failed") from err
+    parsed = parse_document(b"".join(chunks))
     return parsed, canonical_hash(parsed)
 
 

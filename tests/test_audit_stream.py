@@ -11,6 +11,26 @@ from aeo_validator_service import audit_stream
 
 
 class TestConfig:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "not-a-url",
+            "file:///tmp/audit",
+            "https://user:secret@audit.example",
+            "https://audit.example/?token=secret",
+            "https://audit.example/#fragment",
+        ],
+    )
+    def test_unsafe_destination_is_disabled(self, monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_URL", url)
+        assert audit_stream.base_url() is None
+        assert not audit_stream.is_enabled()
+
+    @pytest.mark.parametrize("raw", ["NaN", "inf", "-inf", "bad"])
+    def test_invalid_timeout_uses_default(self, monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_TIMEOUT_S", raw)
+        assert audit_stream.timeout_s() == audit_stream.DEFAULT_TIMEOUT_S
+
     def test_disabled_when_env_var_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("AUDIT_STREAM_URL", raising=False)
         assert audit_stream.is_enabled() is False
@@ -44,6 +64,23 @@ class TestConfig:
 
 
 class TestEmit:
+    @pytest.mark.asyncio
+    async def test_failure_log_omits_destination_and_payload(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_URL", "https://audit.example/private-path")
+
+        def fail(_request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("sensitive upstream detail")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as client:
+            await audit_stream.emit(client, kind="watch_created", payload={"url": "sensitive vendor path"})
+
+        logged = capsys.readouterr().out
+        assert logged == "audit-stream emit failed\n"
+        assert "sensitive" not in logged
+        assert "private-path" not in logged
+
     @pytest.mark.asyncio
     async def test_emit_is_noop_when_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("AUDIT_STREAM_URL", raising=False)

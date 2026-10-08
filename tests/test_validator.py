@@ -28,9 +28,13 @@ class TestUniversalChecks:
         _, _, issues = SuiteValidator().validate({"aeo_version": ""})
         assert any(i.kind == "missing_or_blank_version" for i in issues)
 
-    def test_unknown_spec_warning(self) -> None:
+    def test_unknown_spec_is_invalid(self) -> None:
         _, _, issues = SuiteValidator().validate({"foo": "bar"})
-        assert any(i.kind == "unknown_spec" and i.severity == "warning" for i in issues)
+        assert any(i.kind == "unknown_spec" and i.severity == "error" for i in issues)
+
+    def test_multiple_spec_versions_are_ambiguous(self) -> None:
+        _, _, issues = SuiteValidator().validate({"aeo_version": "0.1", "agent_card_version": "0.1"})
+        assert any(i.kind == "ambiguous_spec" and i.severity == "error" for i in issues)
 
 
 class TestAeoChecks:

@@ -11,12 +11,13 @@ Set `AUDIT_STREAM_URL=` (empty) or unset to disable. Set
 `AUDIT_STREAM_TIMEOUT_S=2.5` to override the default fire-and-forget
 timeout.
 
-This is the same shape as `procurement-decision-api.audit_stream` —
-identical config, identical fail-safe semantics, different event kinds.
+This uses the same opt-in event shape as `procurement-decision-api.audit_stream`.
+It is best-effort and does not confirm durable acceptance.
 """
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -26,27 +27,42 @@ DEFAULT_TIMEOUT_S = 2.5
 
 
 def is_enabled() -> bool:
-    """True when AUDIT_STREAM_URL is set to a non-empty value."""
-    return bool(os.environ.get("AUDIT_STREAM_URL", "").strip())
+    """True when a usable HTTP(S) audit destination is configured."""
+    return base_url() is not None
 
 
 def base_url() -> str | None:
-    """Stripped audit-stream base URL, or None when disabled."""
+    """HTTP(S) audit base URL without credentials, query, or fragment."""
     raw = os.environ.get("AUDIT_STREAM_URL", "").strip()
     if not raw:
         return None
-    return raw.rstrip("/")
+    try:
+        parsed = httpx.URL(raw)
+    except (ValueError, httpx.InvalidURL):
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.host
+        or parsed.userinfo
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return str(parsed).rstrip("/")
 
 
 def timeout_s() -> float:
-    """Configured per-call timeout. Defaults to 2.5s."""
+    """Configured per-call timeout, bounded to 0.1-30 seconds."""
     raw = os.environ.get("AUDIT_STREAM_TIMEOUT_S", "").strip()
     if not raw:
         return DEFAULT_TIMEOUT_S
     try:
-        return max(0.1, float(raw))
+        value = float(raw)
     except ValueError:
         return DEFAULT_TIMEOUT_S
+    if not math.isfinite(value):
+        return DEFAULT_TIMEOUT_S
+    return min(30.0, max(0.1, value))
 
 
 async def emit(
@@ -79,8 +95,5 @@ async def emit(
             timeout=timeout_s(),
         )
         response.raise_for_status()
-    except (httpx.HTTPError, OSError) as err:
-        print(
-            f"audit-stream emit failed (kind={kind}): {type(err).__name__}: {err}",
-            flush=True,
-        )
+    except (httpx.HTTPError, OSError):
+        print("audit-stream emit failed", flush=True)
