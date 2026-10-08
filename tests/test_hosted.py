@@ -2,24 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import httpcore
 import httpx
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from aeo_validator_service import app as app_module
-from aeo_validator_service import fetcher
+from aeo_validator_service import fetcher, request_guard
 from aeo_validator_service.app import app
 from aeo_validator_service.models import ValidationResult
 from aeo_validator_service.request_guard import MAX_REQUEST_BYTES
 from aeo_validator_service.sqlite_watch_store import SQLiteWatchStore
 from aeo_validator_service.tenant_auth import TenantAuth
+from aeo_validator_service.watch_store import MAX_WATCHES
 
 TOKEN_A = "a" * 64
 TOKEN_B = "b" * 64
@@ -61,6 +65,81 @@ def test_hosted_startup_fails_closed_without_credentials_or_durable_path(
         with TestClient(app):
             pass
     assert not list(tmp_path.iterdir())
+
+
+def test_hosted_startup_rejects_remote_audit_sink(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _hosted_environment(monkeypatch, tmp_path / "watches.sqlite3")
+    monkeypatch.setenv("AUDIT_STREAM_URL", "http://audit.example")
+    with pytest.raises(ValueError, match="disabled in hosted pilot"):
+        with TestClient(app):
+            pass
+
+
+def test_hosted_never_emits_to_remote_sink_even_if_runtime_env_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _hosted_environment(monkeypatch, tmp_path / "watches.sqlite3")
+    monkeypatch.delenv("AUDIT_STREAM_URL", raising=False)
+    real_client = httpx.AsyncClient
+
+    async def public_dns(_host: str) -> str:
+        return "93.184.215.14"
+
+    async def forbidden_emit(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("remote audit must be disabled in hosted mode")
+
+    monkeypatch.setattr(fetcher, "_check_public_dns", public_dns)
+    monkeypatch.setattr(app_module.audit_stream, "emit", forbidden_emit)
+    monkeypatch.setattr(
+        app_module.httpx,
+        "AsyncClient",
+        lambda *_args, **_kwargs: real_client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=BODY))
+        ),
+    )
+    with TestClient(app) as client:
+        monkeypatch.setenv("AUDIT_STREAM_URL", "http://audit.example")
+        created = client.post(
+            "/watches", json={"url": "https://acme.example/doc.json"}, headers=_auth(TOKEN_A)
+        )
+        assert created.status_code == 201
+        monkeypatch.delenv("AUDIT_STREAM_URL")
+
+
+@pytest.mark.asyncio
+async def test_slow_request_body_hits_total_read_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = FastAPI()
+    service.state.tenant_auth = TenantAuth(False, {})
+    seen: list[dict[str, Any]] = []
+
+    async def inner(_scope: object, _receive: object, _send: object) -> None:
+        raise AssertionError("overslow request must not reach route")
+
+    async def slow_receive() -> dict[str, Any]:
+        await asyncio.sleep(1)
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        seen.append(message)
+
+    monkeypatch.setattr(request_guard, "MAX_REQUEST_READ_SECONDS", 0.001)
+    guard = request_guard.RequestGuard(inner, service_app=service)
+    await guard(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/validate/inline",
+            "headers": [],
+            "scheme": "http",
+            "http_version": "1.1",
+            "server": ("test", 80),
+            "client": ("test", 1234),
+        },
+        slow_receive,
+        send,
+    )
+    assert seen[0]["type"] == "http.response.start"
+    assert seen[0]["status"] == 408
 
 
 def test_hosted_auth_isolation_persistence_and_audit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -178,6 +257,59 @@ def test_sqlite_retention_deletes_expired_watch_history_and_audit(tmp_path: Path
     with sqlite3.connect(path) as db:
         for table in ("watches", "results", "audit_events"):
             assert db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_shorter_retention_on_restart_removes_old_watch(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = SQLiteWatchStore(str(path), retention_days=30)
+    store.create("https://acme.example/doc.json", tenant="buyer-a")
+    store.close()
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE watches SET created_at = '2000-01-01T00:00:00+00:00'")
+    shortened = SQLiteWatchStore(str(path), retention_days=1)
+    assert shortened.list_ids(tenant="buyer-a") == []
+    shortened.close()
+
+
+def test_tenant_watch_quota_does_not_starve_another_tenant(tmp_path: Path) -> None:
+    store = SQLiteWatchStore(str(tmp_path / "state.sqlite3"))
+    for _ in range(MAX_WATCHES):
+        store.create("https://acme.example/doc.json", tenant="buyer-a")
+    assert not store.has_capacity("buyer-a")
+    assert store.has_capacity("buyer-b")
+    assert store.create("https://other.example/doc.json", tenant="buyer-b").watch_id
+    store.close()
+
+
+def test_concurrent_rechecks_compare_against_last_committed_result(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = SQLiteWatchStore(str(path))
+    initial = ValidationResult(
+        url="https://acme.example/doc.json",
+        fetched_at="2026-10-07T00:00:00+00:00",
+        content_hash="sha256:" + "0" * 64,
+        spec="aeo",
+        valid=True,
+        body={"aeo_version": "0.1", "name": "initial"},
+    )
+    watch = first.create_with_result(initial.url, initial, tenant="buyer-a")
+    second = SQLiteWatchStore(str(path))
+    changed_a = initial.model_copy(
+        update={"content_hash": "sha256:" + "1" * 64, "body": {"aeo_version": "0.1", "name": "A"}}
+    )
+    changed_b = initial.model_copy(
+        update={"content_hash": "sha256:" + "2" * 64, "body": {"aeo_version": "0.1", "name": "B"}}
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        one = pool.submit(first.record_and_diff, watch.watch_id, changed_a, tenant="buyer-a")
+        two = pool.submit(second.record_and_diff, watch.watch_id, changed_b, tenant="buyer-a")
+        reports = [one.result(), two.result()]
+    first.close()
+    second.close()
+    before_hashes = {report.content_hash_before for report in reports}
+    assert initial.content_hash in before_hashes
+    assert len(before_hashes) == 2
+    assert before_hashes & {changed_a.content_hash, changed_b.content_hash}
 
 
 def test_local_sqlite_backup_and_restore_drill(tmp_path: Path) -> None:

@@ -14,6 +14,7 @@ Keep `HOST=127.0.0.1` unless a named deployment places a TLS gateway and network
 | `AEO_WATCH_RETENTION_DAYS` | 1–30 days, default 7. Each watch has a fixed expiry from creation; rechecks do not extend it. |
 | `AEO_FETCH_ALLOWED_HOSTS` | Global exact-host fetch allowlist. Unset means no remote fetch. |
 | `AEO_TENANT_ALLOWED_HOSTS` | JSON map from tenant ID to exact hosts that tenant may fetch. Unset means no tenant may fetch. A host must appear in both allowlists. |
+| `AUDIT_STREAM_URL` | Must be unset in hosted mode. A configured remote sink fails startup until its egress and privacy boundary is approved. |
 
 Generate token values outside the repository in a credential manager. Give each tenant a different token. Pass `Authorization: Bearer <token>` on all routes except `/` and `/healthz`. The service stores only configured token digests in memory, compares digests in constant time, and does not emit token values in the SQLite audit trail. A global token does not grant a tenant access to another tenant's watches. Invalid and cross-tenant watch IDs return 404.
 
@@ -21,10 +22,11 @@ For rotation, temporarily list two digests for the same tenant, restart the sing
 
 ## Data and egress boundary
 
-- The pilot SQLite file holds watch metadata, the latest fetched document body for top-level drift comparison, up to 20 results per watch, and operational audit rows. Older result bodies are dropped when a new result is recorded. One-shot validation responses are not stored, but their tenant, action, validity, and content hash are audited. Watch create, recheck, and delete are audited without bearer tokens or fetched bodies.
-- At startup and on each watch or audit access, records past the configured retention are removed. There is no independent timed sweeper. SQLite deletion does not prove secure erasure from WAL pages, filesystem snapshots, or backups. Define storage encryption, backup expiry, and deletion verification for a real target before accepting customer data.
+- The pilot SQLite file holds watch metadata, the latest fetched document body for top-level drift comparison, up to 20 results per watch, and operational audit rows. Each tenant can hold up to 16 watches, with a 64-watch file-wide ceiling. Older result bodies are dropped when a new result is recorded. One-shot validation responses are not stored, but their tenant, action, validity, and content hash are audited. Watch create, recheck, and delete are audited without bearer tokens or fetched bodies. Recheck comparison and recording share one SQLite write transaction.
+- At startup and on each watch or audit access, records past the configured retention are removed. Lowering the retention setting on restart also removes older watches immediately. There is no independent timed sweeper. SQLite deletion does not prove secure erasure from WAL pages, filesystem snapshots, or backups. Define storage encryption, backup expiry, and deletion verification for a real target before accepting customer data.
 - Outbound vendor fetches require both allowlists, HTTPS port 443, no URL credentials/query/fragment, all-public DNS answers, no redirect, a streaming 2 MiB response cap, and a connection to a checked IP with the original hostname used for HTTP Host and TLS SNI. The service ignores proxy environment variables and disables keepalive reuse. The code path is bounded to `httpx>=0.28.1,<0.29` and `httpcore>=1.0.9,<1.1`.
 - This still needs a deployment egress firewall, an ingress rate limit, TLS termination, logging controls, volume encryption, backup monitoring, and an operator incident path. Keep remote fetching disabled in a first synthetic pilot.
+- Inbound bodies are limited to 2 MiB plus 16 KiB JSON wrapper overhead and must arrive within 10 seconds. This protects application buffering; an ingress gateway still needs its own connection and rate limits.
 
 ## Local rollback exercise
 

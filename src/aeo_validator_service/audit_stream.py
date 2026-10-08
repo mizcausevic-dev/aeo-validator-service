@@ -1,7 +1,7 @@
 """
 Optional audit-stream-py integration.
 
-When the `AUDIT_STREAM_URL` env var is set, this module fires
+In default local mode, when the `AUDIT_STREAM_URL` env var is set, this module fires
 governance events at `{AUDIT_STREAM_URL}/events` for the moments the
 service produces. Best-effort: a failed POST is logged, not raised —
 audit-stream outages must never block watch creation, validation, or
@@ -13,6 +13,7 @@ timeout.
 
 This uses the same opt-in event shape as `procurement-decision-api.audit_stream`.
 It is best-effort and does not confirm durable acceptance.
+The app rejects a configured remote sink at startup in hosted pilot mode.
 """
 
 from __future__ import annotations

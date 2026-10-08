@@ -29,7 +29,6 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from . import __version__, audit_stream
-from .drift import compute_drift
 from .fetcher import DEFAULT_TIMEOUT_S, FetchError, canonical_hash, fetch_and_parse, now_iso
 from .models import DriftReport, SpecKind, ValidationIssue, ValidationResult, Watch
 from .request_guard import RequestGuard
@@ -57,6 +56,8 @@ class _CreateWatchRequest(BaseModel):
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.tenant_auth = TenantAuth.from_environment()
+    if app.state.tenant_auth.enabled and os.getenv("AUDIT_STREAM_URL", "").strip():
+        raise ValueError("AUDIT_STREAM_URL is disabled in hosted pilot mode")
     app.state.validator = SuiteValidator()
     if app.state.tenant_auth.enabled:
         path = os.getenv("AEO_WATCH_DB_PATH", "")
@@ -121,6 +122,12 @@ def _audit_validation(tenant: str, action: str, result: ValidationResult) -> Non
 
 def _authorize_fetch(tenant: str, url: str) -> None:
     cast(TenantAuth, app.state.tenant_auth).authorize_fetch(tenant, url)
+
+
+async def _emit_optional_audit(kind: str, payload: dict[str, Any]) -> None:
+    if cast(TenantAuth, app.state.tenant_auth).enabled:
+        return
+    await audit_stream.emit(_client(), kind=kind, payload=payload)
 
 
 def _public_result(result: ValidationResult) -> ValidationResult:
@@ -276,8 +283,7 @@ async def create_watch(req: _CreateWatchRequest, request: Request) -> Watch:
         raise HTTPException(status_code=429, detail=str(err)) from err
 
     # Best-effort audit-stream emission.
-    await audit_stream.emit(
-        _client(),
+    await _emit_optional_audit(
         kind="watch_created",
         payload={
             "watch_id": recorded.watch_id,
@@ -341,18 +347,15 @@ async def recheck_watch(watch_id: str, request: Request) -> DriftReport:
         include_body=True,
     )
     try:
-        previous = _watches().previous(watch_id, tenant=tenant)
-        _watches().record(watch_id, new_result, tenant=tenant)
+        drift = _watches().record_and_diff(watch_id, new_result, tenant=tenant)
     except KeyError as err:
         raise HTTPException(status_code=404, detail="unknown watch_id") from err
-    drift = compute_drift(previous, new_result)
 
     # Best-effort audit-stream emission. We fire at most ONE event per
     # recheck — validity_flipped takes precedence over drifted since it's
     # the more actionable signal.
     if drift.became_invalid or drift.became_valid:
-        await audit_stream.emit(
-            _client(),
+        await _emit_optional_audit(
             kind="watch_validity_flipped",
             payload={
                 "watch_id": watch_id,
@@ -366,8 +369,7 @@ async def recheck_watch(watch_id: str, request: Request) -> DriftReport:
             },
         )
     elif drift.drifted:
-        await audit_stream.emit(
-            _client(),
+        await _emit_optional_audit(
             kind="watch_drifted",
             payload={
                 "watch_id": watch_id,

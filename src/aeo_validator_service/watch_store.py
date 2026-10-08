@@ -14,8 +14,9 @@ from __future__ import annotations
 import uuid
 from threading import Lock
 
+from .drift import compute_drift
 from .fetcher import now_iso
-from .models import ValidationResult, Watch
+from .models import DriftReport, ValidationResult, Watch
 
 MAX_WATCHES = 16
 MAX_HISTORY = 20
@@ -72,6 +73,29 @@ class WatchStore:
             updated = watch.model_copy(update={"last_result": result, "history_count": len(history)})
             self._watches[watch_id] = updated
         return updated
+
+    def record_and_diff(
+        self, watch_id: str, result: ValidationResult, *, tenant: str = "local"
+    ) -> DriftReport:
+        """Compare and append under one lock so concurrent rechecks see ordered history."""
+        del tenant
+        with self._lock:
+            try:
+                watch = self._watches[watch_id]
+            except KeyError as err:
+                raise KeyError(f"unknown watch_id: {watch_id!r}") from err
+            history = self._history[watch_id]
+            previous = history[-1] if history else None
+            drift = compute_drift(previous, result)
+            if history:
+                history[-1] = history[-1].model_copy(update={"body": None})
+            history.append(result)
+            if len(history) > MAX_HISTORY:
+                history.pop(0)
+            self._watches[watch_id] = watch.model_copy(
+                update={"last_result": result, "history_count": len(history)}
+            )
+            return drift
 
     def get(self, watch_id: str, *, tenant: str = "local") -> Watch:
         del tenant

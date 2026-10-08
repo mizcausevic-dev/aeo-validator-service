@@ -14,8 +14,11 @@ from pathlib import Path
 from threading import Lock
 from typing import cast
 
-from .models import SpecKind, ValidationResult, Watch
+from .drift import compute_drift
+from .models import DriftReport, SpecKind, ValidationResult, Watch
 from .watch_store import MAX_HISTORY, MAX_WATCHES
+
+MAX_TOTAL_WATCHES = 64
 
 
 class SQLiteWatchStore:
@@ -72,18 +75,26 @@ class SQLiteWatchStore:
 
     def _purge(self) -> None:
         now = datetime.now(UTC)
-        self._db.execute("DELETE FROM watches WHERE expires_at <= ?", (now.isoformat(timespec="seconds"),))
         cutoff = (now - timedelta(days=self.retention_days)).isoformat(timespec="seconds")
+        # A shorter policy on restart takes effect immediately, even for
+        # watches created under a longer earlier retention setting.
+        self._db.execute(
+            "DELETE FROM watches WHERE expires_at <= ? OR created_at <= ?",
+            (now.isoformat(timespec="seconds"), cutoff),
+        )
         self._db.execute("DELETE FROM audit_events WHERE recorded_at <= ?", (cutoff,))
         # Keep expiry durable even when the subsequent lookup returns 404.
         self._db.commit()
 
+    def _has_capacity(self, tenant: str) -> bool:
+        total = self._db.execute("SELECT count(*) FROM watches").fetchone()[0]
+        owned = self._db.execute("SELECT count(*) FROM watches WHERE tenant_id = ?", (tenant,)).fetchone()[0]
+        return bool(total < MAX_TOTAL_WATCHES and owned < MAX_WATCHES)
+
     def has_capacity(self, tenant: str = "local") -> bool:
-        del tenant  # Keep the global 16-watch memory/disk cap across all tenants.
         with self._lock, self._db:
             self._purge()
-            count = self._db.execute("SELECT count(*) FROM watches").fetchone()[0]
-            return bool(count < MAX_WATCHES)
+            return self._has_capacity(tenant)
 
     def create(self, url: str, *, spec_hint: str | None = None, tenant: str = "local") -> Watch:
         watch_id = uuid.uuid4().hex
@@ -92,8 +103,8 @@ class SQLiteWatchStore:
         expires_at = (now + timedelta(days=self.retention_days)).isoformat(timespec="seconds")
         with self._lock, self._db:
             self._purge()
-            count = self._db.execute("SELECT count(*) FROM watches").fetchone()[0]
-            if count >= MAX_WATCHES:
+            self._db.execute("BEGIN IMMEDIATE")
+            if not self._has_capacity(tenant):
                 raise OverflowError("watch limit reached")
             self._db.execute(
                 "INSERT INTO watches VALUES (?, ?, ?, ?, ?, ?)",
@@ -124,8 +135,8 @@ class SQLiteWatchStore:
         expires_at = (now + timedelta(days=self.retention_days)).isoformat(timespec="seconds")
         with self._lock, self._db:
             self._purge()
-            count = self._db.execute("SELECT count(*) FROM watches").fetchone()[0]
-            if count >= MAX_WATCHES:
+            self._db.execute("BEGIN IMMEDIATE")
+            if not self._has_capacity(tenant):
                 raise OverflowError("watch limit reached")
             self._db.execute(
                 "INSERT INTO watches VALUES (?, ?, ?, ?, ?, ?)",
@@ -194,31 +205,47 @@ class SQLiteWatchStore:
             last_result=last,
         )
 
+    def _record_locked(
+        self, watch_id: str, result: ValidationResult, tenant: str
+    ) -> tuple[Watch, DriftReport]:
+        row = self._watch_row(watch_id, tenant)
+        previous = self._db.execute(
+            "SELECT id, result_json FROM results WHERE watch_id = ? ORDER BY id DESC LIMIT 1", (watch_id,)
+        ).fetchone()
+        old = ValidationResult.model_validate_json(previous["result_json"]) if previous else None
+        drift = compute_drift(old, result)
+        if previous is not None and old is not None:
+            self._db.execute(
+                "UPDATE results SET result_json = ? WHERE id = ?",
+                (old.model_copy(update={"body": None}).model_dump_json(), previous["id"]),
+            )
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+        self._db.execute(
+            "INSERT INTO results(watch_id, recorded_at, result_json) VALUES (?, ?, ?)",
+            (watch_id, now, result.model_dump_json()),
+        )
+        self._db.execute(
+            "DELETE FROM results WHERE watch_id = ? AND id NOT IN "
+            "(SELECT id FROM results WHERE watch_id = ? ORDER BY id DESC LIMIT ?)",
+            (watch_id, watch_id, MAX_HISTORY),
+        )
+        self._audit(tenant, watch_id, "rechecked" if previous else "initial_result", now, result)
+        return self._build_watch(row), drift
+
     def record(self, watch_id: str, result: ValidationResult, *, tenant: str = "local") -> Watch:
         with self._lock, self._db:
             self._purge()
-            row = self._watch_row(watch_id, tenant)
-            previous = self._db.execute(
-                "SELECT id, result_json FROM results WHERE watch_id = ? ORDER BY id DESC LIMIT 1", (watch_id,)
-            ).fetchone()
-            if previous is not None:
-                old = ValidationResult.model_validate_json(previous["result_json"])
-                self._db.execute(
-                    "UPDATE results SET result_json = ? WHERE id = ?",
-                    (old.model_copy(update={"body": None}).model_dump_json(), previous["id"]),
-                )
-            now = datetime.now(UTC).isoformat(timespec="seconds")
-            self._db.execute(
-                "INSERT INTO results(watch_id, recorded_at, result_json) VALUES (?, ?, ?)",
-                (watch_id, now, result.model_dump_json()),
-            )
-            self._db.execute(
-                "DELETE FROM results WHERE watch_id = ? AND id NOT IN "
-                "(SELECT id FROM results WHERE watch_id = ? ORDER BY id DESC LIMIT ?)",
-                (watch_id, watch_id, MAX_HISTORY),
-            )
-            self._audit(tenant, watch_id, "rechecked" if previous else "initial_result", now, result)
-            return self._build_watch(row)
+            self._db.execute("BEGIN IMMEDIATE")
+            return self._record_locked(watch_id, result, tenant)[0]
+
+    def record_and_diff(
+        self, watch_id: str, result: ValidationResult, *, tenant: str = "local"
+    ) -> DriftReport:
+        """Compare, update, and audit in one SQLite write transaction."""
+        with self._lock, self._db:
+            self._purge()
+            self._db.execute("BEGIN IMMEDIATE")
+            return self._record_locked(watch_id, result, tenant)[1]
 
     def get(self, watch_id: str, *, tenant: str = "local") -> Watch:
         with self._lock, self._db:
@@ -254,6 +281,7 @@ class SQLiteWatchStore:
     def delete(self, watch_id: str, *, tenant: str = "local") -> None:
         with self._lock, self._db:
             self._purge()
+            self._db.execute("BEGIN IMMEDIATE")
             deleted = self._db.execute(
                 "DELETE FROM watches WHERE watch_id = ? AND tenant_id = ?", (watch_id, tenant)
             )

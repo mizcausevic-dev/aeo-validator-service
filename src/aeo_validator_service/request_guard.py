@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 MAX_REQUEST_BYTES = 2 * 1024 * 1024 + 16 * 1024
+MAX_REQUEST_READ_SECONDS = 10.0
 
 
 class RequestGuard:
@@ -50,20 +53,31 @@ class RequestGuard:
 
         chunks: list[bytes] = []
         total = 0
-        while True:
-            event = await receive()
-            if event["type"] == "http.disconnect":
-                return
-            chunk = event.get("body", b"")
-            total += len(chunk)
-            if total > MAX_REQUEST_BYTES:
-                await JSONResponse({"detail": "request body exceeds size limit"}, status_code=413)(
-                    scope, receive, send
-                )
-                return
-            chunks.append(chunk)
-            if not event.get("more_body", False):
-                break
+        too_large = False
+        try:
+            async with asyncio.timeout(MAX_REQUEST_READ_SECONDS):
+                while True:
+                    event = await receive()
+                    if event["type"] == "http.disconnect":
+                        return
+                    chunk = event.get("body", b"")
+                    total += len(chunk)
+                    if total > MAX_REQUEST_BYTES:
+                        too_large = True
+                        break
+                    chunks.append(chunk)
+                    if not event.get("more_body", False):
+                        break
+        except TimeoutError:
+            await JSONResponse({"detail": "request body read timed out"}, status_code=408)(
+                scope, receive, send
+            )
+            return
+        if too_large:
+            await JSONResponse({"detail": "request body exceeds size limit"}, status_code=413)(
+                scope, receive, send
+            )
+            return
 
         replayed = False
 
