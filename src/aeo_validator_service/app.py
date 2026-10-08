@@ -196,6 +196,8 @@ async def validate_inline(req: _ValidateInlineRequest) -> ValidationResult:
 
 @app.post("/watches", tags=["watches"], status_code=201)
 async def create_watch(req: _CreateWatchRequest) -> Watch:
+    if not _watches().has_capacity():
+        raise HTTPException(status_code=429, detail="watch limit reached")
     try:
         body, content_hash = await fetch_and_parse(_client(), req.url)
     except FetchError as err:

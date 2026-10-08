@@ -212,6 +212,23 @@ class TestWatchLifecycle:
         assert created.json()["last_result"]["valid"] is False
         assert created.json()["last_result"]["issues"][0]["kind"] == "spec_hint_mismatch"
 
+    def test_full_watch_store_rejects_before_fetch(
+        self,
+        client_with_aeo: tuple[TestClient, dict[str, dict[str, Any]]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from aeo_validator_service import watch_store
+
+        client, _ = client_with_aeo
+        monkeypatch.setattr(watch_store, "MAX_WATCHES", 0)
+
+        async def unexpected_fetch(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("fetch should not run when watch capacity is exhausted")
+
+        monkeypatch.setattr(app_module, "fetch_and_parse", unexpected_fetch)
+        response = client.post("/watches", json={"url": "https://acme.example/.well-known/aeo.json"})
+        assert response.status_code == 429
+
     def test_list_and_get(self, client_with_aeo: tuple[TestClient, dict[str, dict[str, Any]]]) -> None:
         client, _ = client_with_aeo
         r = client.post("/watches", json={"url": "https://acme.example/.well-known/aeo.json"})

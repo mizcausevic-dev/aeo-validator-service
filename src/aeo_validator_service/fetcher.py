@@ -14,7 +14,7 @@ import json
 import math
 import os
 import socket
-from asyncio import get_running_loop
+from asyncio import get_running_loop, wait_for
 from datetime import UTC, datetime
 from typing import Any
 
@@ -46,7 +46,12 @@ def _allowed_hosts() -> set[str]:
 
 async def _check_public_dns(host: str) -> None:
     try:
-        answers = await get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        answers = await wait_for(
+            get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM),
+            timeout=DEFAULT_TIMEOUT_S,
+        )
+    except TimeoutError as err:
+        raise FetchError("URL host resolution timed out") from err
     except OSError as err:
         raise FetchError("URL host could not be resolved") from err
     if not answers:

@@ -31,6 +31,11 @@ class WatchStore:
         self._history: dict[str, list[ValidationResult]] = {}
         self._lock = Lock()
 
+    def has_capacity(self) -> bool:
+        """Avoid a fetch when the process-local watch store is already full."""
+        with self._lock:
+            return len(self._watches) < MAX_WATCHES
+
     def create(self, url: str, *, spec_hint: str | None = None) -> Watch:
         watch_id = uuid.uuid4().hex[:12]
         with self._lock:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -40,6 +42,19 @@ async def test_url_rejects_private_target_and_redirect_vectors(monkeypatch: pyte
 async def test_real_localhost_dns_is_not_public() -> None:
     with pytest.raises(fetcher.FetchError, match="non-public"):
         await fetcher._check_public_dns("localhost")
+
+
+@pytest.mark.asyncio
+async def test_dns_resolution_has_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    class SlowLoop:
+        async def getaddrinfo(self, *_args: object, **_kwargs: object) -> list[object]:
+            await asyncio.sleep(1)
+            return []
+
+    monkeypatch.setattr(fetcher, "get_running_loop", SlowLoop)
+    monkeypatch.setattr(fetcher, "DEFAULT_TIMEOUT_S", 0.001)
+    with pytest.raises(fetcher.FetchError, match="resolution timed out"):
+        await fetcher._check_public_dns("vendor.example")
 
 
 @pytest.mark.asyncio
