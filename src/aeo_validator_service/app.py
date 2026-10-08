@@ -12,7 +12,7 @@ Endpoints:
   POST /watches                         { url } -> creates a watch, validates immediately
   GET  /watches                         list watch IDs
   GET  /watches/{id}                    fetch watch metadata + last result
-  GET  /watches/{id}/history            full validation history
+  GET  /watches/{id}/history            up to 20 recent results, without bodies
   POST /watches/{id}/recheck            re-fetch + validate; returns the drift report
   DELETE /watches/{id}                  delete the watch
 """
@@ -139,10 +139,10 @@ async def root() -> dict[str, Any]:
             "GET  /healthz": "liveness probe",
             "POST /validate/by-url": "fetch + validate by URL (one-shot)",
             "POST /validate/inline": "validate an already-fetched document",
-            "POST /watches": "create a persistent watch for a URL",
+            "POST /watches": "create a process-local watch for a URL",
             "GET  /watches": "list watch IDs",
             "GET  /watches/{id}": "watch metadata + last result",
-            "GET  /watches/{id}/history": "full validation history",
+            "GET  /watches/{id}/history": "up to 20 recent results, without bodies",
             "POST /watches/{id}/recheck": "re-fetch + validate; returns drift report",
             "DELETE /watches/{id}": "delete the watch",
         },
