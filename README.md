@@ -21,7 +21,7 @@ The CLI answers "does this document pass its checks right now?" This local HTTP 
 
 1. **HTTP for non-Python services.** The CLI is Python-only. The service is a curl away.
 2. **Drift across manual checks.** Hash a vendor's AEO document, re-check it later, and identify changed top-level fields.
-3. **Process-local watches.** A watch holds a bounded history for comparison while this process runs. There is no scheduler, durable store, or alert delivery.
+3. **Bounded watches.** Default watches are process-local. An opt-in single-node pilot mode stores tenant-scoped watches and an operational audit trail in SQLite. There is no scheduler or alert delivery.
 
 ---
 
@@ -32,9 +32,9 @@ pip install aeo-validator-service
 aeo-validator-service          # binds 127.0.0.1:8091
 ```
 
-Python 3.11+. Runtime deps: `fastapi`, `httpx`, `pydantic`, `uvicorn`. Remote fetching is disabled until `AEO_FETCH_ALLOWED_HOSTS` names exact vendor hostnames. For example, set `AEO_FETCH_ALLOWED_HOSTS=acme.example` before starting the service. URLs must use HTTPS on port 443, cannot redirect, and cannot carry credentials or query parameters. DNS is checked for non-public addresses before each fetch; a network egress policy is still needed to close DNS rebinding at the actual connection.
+Python 3.11+. Runtime deps: `fastapi`, `httpx`, `httpcore`, `pydantic`, `uvicorn`. Remote fetching is disabled until `AEO_FETCH_ALLOWED_HOSTS` names exact vendor hostnames. For example, set `AEO_FETCH_ALLOWED_HOSTS=acme.example` before starting the service. URLs must use HTTPS on port 443, cannot redirect, and cannot carry credentials or query parameters. DNS answers are checked for non-public addresses; the request connects to a checked IP while preserving the vendor hostname for HTTP Host and TLS SNI. The tested dependency bounds are `httpx>=0.28.1,<0.29` and `httpcore>=1.0.9,<1.1`. A deployment egress firewall is still required.
 
-All endpoints are unauthenticated. Keep the process on loopback for local development. Do not expose it on a public network or use it for buyer authorization. A hosted service also needs authenticated callers, tenant isolation, network egress enforcement, rate limits, durable watch and audit state, and an operator runbook.
+The default local mode is unauthenticated and binds loopback. `AEO_HOSTED_MODE=1` enables static tenant bearer credentials, per-tenant remote-host authorization, a 2 MiB plus wrapper-overhead request cap, and SQLite watch and audit retention. It fails startup when credentials or a durable path are missing. See [HOSTED_PILOT.md](https://github.com/mizcausevic-dev/aeo-validator-service/blob/main/HOSTED_PILOT.md) for configuration and limits. This mode is for a **synthetic, single-node pilot**, not customer traffic: it has no buyer identity proof, roles, gateway rate limit, encrypted storage policy, or tested live rollback.
 
 ---
 
@@ -46,7 +46,7 @@ All endpoints are unauthenticated. Keep the process on loopback for local develo
 | GET | `/healthz` | Liveness probe. |
 | POST | `/validate/by-url` | Fetch + validate by URL. One-shot, no watch. |
 | POST | `/validate/inline` | Validate an already-fetched document — no network. |
-| POST | `/watches` | Create a process-local watch for a URL; the initial fetch + validation runs synchronously. |
+| POST | `/watches` | Create a bounded watch for a URL; the initial fetch + validation runs synchronously. |
 | GET | `/watches` | List watch IDs. |
 | GET | `/watches/{id}` | Watch metadata + last result. |
 | GET | `/watches/{id}/history` | Up to 20 recent results (oldest → newest), without fetched bodies. |
@@ -132,7 +132,7 @@ curl -X POST http://localhost:8091/watches/a1b2c3/recheck
 
 `content_hash` is `sha256:<hex>` over Python sorted-key, compact JSON, with default ASCII escaping. It matches the **legacy** hash in [`procurement-decision-api`](https://github.com/mizcausevic-dev/procurement-decision-api) for the same parsed JSON values. It is **not** the versioned RFC 8785 JCS hash used by `hash-attestation-rs` v0.2 or procurement's `document_hashes[]`. Do not compare these hash profiles or treat a hash as publisher authentication.
 
-Fetched JSON rejects duplicate object keys and non-finite numbers. A fetch is capped at 2 MiB while streaming. The 16-watch limit and 20-result history bound limit local memory use; all watch data is lost on restart. Watch API responses omit document bodies. The optional audit-stream event contains the URL and document hash, and its delivery is best effort.
+Fetched JSON rejects duplicate object keys and non-finite numbers. A fetch is capped at 2 MiB while streaming. Inline request bodies are capped at 2 MiB plus wrapper overhead before JSON parsing. The 16-watch limit and 20-result history bound limit local memory and disk use; default watch data is lost on restart. Hosted pilot watches expire 1–30 days after creation. Watch API responses omit document bodies, but the pilot SQLite file stores each watch's latest body for drift comparison. The optional remote audit-stream event contains the URL and document hash, and its delivery is best effort. The pilot SQLite operational audit records tenant, action, timestamp, validity, and hash without document bodies.
 
 ---
 
@@ -145,7 +145,7 @@ mypy src
 pytest -v
 ```
 
-Test fixtures use `httpx.MockTransport` so no vendor URL is fetched. CI matrix Python 3.11 / 3.12 / 3.13. Local tests do not prove hosted egress, authentication, persistence, or an operator rollback.
+Test fixtures use `httpx.MockTransport` so no vendor URL is fetched. The pinned-IP/TLS handoff is tested with the installed `httpcore` network backend, and the hosted pilot has local tenant, persistence, retention, and backup/restore tests. CI matrix Python 3.11 / 3.12 / 3.13. These local tests do not prove a deployed gateway, real buyer identity, storage encryption, external egress rules, or a live operator rollback.
 
 ---
 

@@ -5,10 +5,11 @@ from __future__ import annotations
 import tarfile
 import zipfile
 from pathlib import Path
+from sys import argv
 
 
 def main() -> None:
-    dist = Path("dist")
+    dist = Path(argv[1]) if len(argv) > 1 else Path("dist")
     sdists = list(dist.glob("*.tar.gz"))
     wheels = list(dist.glob("*.whl"))
     if len(sdists) != 1 or len(wheels) != 1:
@@ -16,7 +17,7 @@ def main() -> None:
 
     with tarfile.open(sdists[0]) as archive:
         names = [member.name.partition("/")[2] for member in archive.getmembers() if member.isfile()]
-    allowed_root = {".gitignore", "LICENSE", "README.md", "pyproject.toml", "PKG-INFO"}
+    allowed_root = {".gitignore", "HOSTED_PILOT.md", "LICENSE", "README.md", "pyproject.toml", "PKG-INFO"}
     unexpected_sdist = [
         name
         for name in names

@@ -59,8 +59,8 @@ def client_with_aeo(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, dict[s
     real_async_client = httpx.AsyncClient
     monkeypatch.setenv("AEO_FETCH_ALLOWED_HOSTS", "acme.example")
 
-    async def public_dns(_host: str) -> None:
-        return None
+    async def public_dns(_host: str) -> str:
+        return "93.184.215.14"
 
     monkeypatch.setattr(fetcher, "_check_public_dns", public_dns)
 
